@@ -1,0 +1,57 @@
+name = "just-a-chit-chat"
+main = "src/index.js"
+compatibility_date = "2024-11-01"
+
+# --- D1 database ---
+# Holds everything except sessions: topics, submissions, pupils, pupil
+# history, teacher-admin accounts, and settings (teacher password / rubric /
+# groq model). Create with:
+#   wrangler d1 create chitchat-v7
+# then paste the returned database_id below, and apply the schema with:
+#   wrangler d1 execute chitchat-v7 --remote --file=schema.sql
+# (drop --remote to also/instead set up a local dev database)
+[[d1_databases]]
+binding = "CCv6_DB"
+database_name = "chitchat-v7"
+database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+
+# --- KV namespace ---
+# Sessions only now (see schema.sql / index.js header comment for why - KV's
+# expirationTtl gives free automatic session expiry that D1 doesn't have
+# built in). Create with:  wrangler kv:namespace create CCv6_DATA
+# Then paste the returned id below.
+kv_namespaces = [
+  { binding = "CCv6_DATA", id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID" }
+]
+
+# --- Teacher password ---
+# Lives in D1 (config table, key "teacher_password"), not hardcoded in this
+# file or the source. Set/replace it once with:
+#   wrangler d1 execute chitchat-v7 --remote --command="INSERT INTO config (key,value) VALUES ('teacher_password','yourSecretPassword') ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+# It can also be changed later from inside the Teacher Tools > Settings tab
+# (which is how it gets salted+hashed - the raw command above stores it as
+# plaintext temporarily, but the app hashes it on first successful login and
+# overwrites the plaintext, same as it always has).
+
+# --- AI marking: Gemini -> Groq -> Workers AI -> offline scorer ---
+# 1st marker: Google Gemini (vision-capable - it's the only one of the three
+# that can actually see the topic picture). Set the real key as a Worker
+# SECRET - never paste it into this file or any source file:
+#   wrangler secret put GEMINI_API_KEY
+# (paste the key from aistudio.google.com/apikey when prompted)
+#
+# 2nd marker: Groq (fast, generous free tier, text-only). Also a Worker SECRET:
+#   wrangler secret put GROQ_API_KEY
+# (paste the key from console.groq.com when prompted)
+#
+# 3rd marker: Cloudflare Workers AI. Free, built in, no signup, text-only -
+# this binding is all it needs.
+#
+# If GEMINI_API_KEY is missing or a Gemini call fails, marking falls back to
+# Groq; if that's also missing/fails, it falls back to Workers AI; if that's
+# also unavailable, it falls back further to an offline rule-based scorer so
+# the app never hard-fails. Groq and Workers AI can't see the picture, so
+# they instead use each topic's optional "Picture Description" field
+# (Teacher Tools -> Topics) to judge the Evidence part - see the README.
+[ai]
+binding = "AI"
