@@ -482,7 +482,7 @@ var PUPIL_JS = [
 "function builderHtml(){",
 "  var t = state.currentTopic;",
 "  var questions = sessionQuestions();",
-"  var img = t.imageUrl ? '<img src=\"'+esc(t.imageUrl)+'\" alt=\"\" style=\"width:100%;max-height:260px;object-fit:cover;border-radius:12px;margin-bottom:14px;\"/>' : '';",
+"  var img = t.imageUrl ? '<img src=\"'+esc(t.imageUrl)+'\" alt=\"\" style=\"width:100%;max-height:640px;object-fit:cover;border-radius:12px;margin-bottom:14px;\"/>' : '';",
 "  var practiceToggle = '<div class=\"row\" style=\"align-items:center;background:var(--sky);padding:10px 14px;border-radius:10px;\">' +",
 "    '<label style=\"display:flex;align-items:center;gap:8px;margin:0;cursor:pointer;\">' +",
 "    '<input type=\"checkbox\" id=\"practiceToggle\" data-action=\"toggle-practice\"'+(state.practiceMode?' checked':'')+' style=\"width:18px;height:18px;\"/>' +",
