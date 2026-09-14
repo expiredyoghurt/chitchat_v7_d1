@@ -37,36 +37,36 @@
  * LOWER() comparisons now instead of .toLowerCase() in JS.
  *
  * Secrets / bindings
- *   env.GEMINI_API_KEY       Question 1's primary marker (vision-capable), wrangler secret put GEMINI_API_KEY (aistudio.google.com/apikey)
- *   env.GROQ_API_KEY         Question 2's primary marker, wrangler secret put GROQ_API_KEY (console.groq.com)
- *   env.AI                   Question 3's primary marker, Cloudflare Workers AI (free, [ai] binding in wrangler.toml)
- *   env.OPENROUTER_API_KEY   Final AI fallback tier for every question, wrangler secret put OPENROUTER_API_KEY (openrouter.ai/keys)
- *   env.OPENROUTER_API_KEY_2 Optional 2nd OpenRouter key, tried after the first if it fails/is rate-limited (same setup, a 2nd account/key)
+ *   env.GEMINI_API_KEY       Vision-capable, 1st tier tried, wrangler secret put GEMINI_API_KEY (aistudio.google.com/apikey)
+ *   env.GEMINI_API_KEY_2     Optional 2nd Gemini key, tried right after the first if it fails/is rate-limited (2nd account/key)
+ *   env.GROQ_API_KEY         2nd tier tried, wrangler secret put GROQ_API_KEY (console.groq.com)
+ *   env.GROQ_API_KEY_2       Optional 2nd Groq key, same idea as GEMINI_API_KEY_2
+ *   env.OPENROUTER_API_KEY   3rd tier tried, wrangler secret put OPENROUTER_API_KEY (openrouter.ai/keys)
+ *   env.OPENROUTER_API_KEY_2 Optional 2nd OpenRouter key, same idea as GEMINI_API_KEY_2
+ *   env.AI                   4th and final AI tier, Cloudflare Workers AI (free, [ai] binding in wrangler.toml)
  *
- *   Each of the 3 questions in a submission has its own dedicated primary AI
- *   marker, but falls through the other two AI providers before giving up,
- *   with OpenRouter as a shared final AI tier for every question (see
- *   ROUND_FALLBACK_CHAINS / aiScore):
- *     Question 1 (index 0): Gemini -> Groq -> Workers AI -> OpenRouter
- *     Question 2 (index 1): Groq -> Workers AI -> Gemini -> OpenRouter
- *     Question 3 (index 2): Workers AI -> Gemini -> Groq -> OpenRouter
- *   Gemini marks question 1 first specifically because it's the only
- *   vision-capable provider here - whenever a Gemini attempt actually runs
- *   (as a primary marker or as a fallback), it's sent the actual topic
+ *   Every question in a submission is marked with the same fixed chain (see
+ *   aiScore): both Gemini keys, then both Groq keys, then both OpenRouter
+ *   keys, then Workers AI. Any tier with no key/binding configured is simply
+ *   skipped. Gemini goes first because it's the only vision-capable provider
+ *   here - whenever a Gemini attempt runs, it's sent the actual topic
  *   picture (fetched + base64-encoded server-side) so the Evidence (E1) part
  *   can be checked against what's really in the picture, not just judged on
- *   plausibility. Every other provider (Groq, Workers AI, OpenRouter) is
+ *   plausibility. Every other provider (Groq, OpenRouter, Workers AI) is
  *   text-only and instead uses the teacher's optional imageDescription field
  *   for the Evidence part (or, failing that, is told plainly it can't see
- *   the picture and to mark E1 on plausibility only). Each attempt in a
- *   question's chain is skipped (not retried) if its key/binding is missing
- *   or the call fails, falling through to the next. Only if every attempt in
- *   a question's chain fails - all 3 AI providers plus both OpenRouter keys -
- *   does that one question fall back to the offline rule-based scorer.
+ *   the picture and to mark E1 on plausibility only).
  *
- *   OpenRouter is only ever allowed to call FREE models (see
- *   isFreeOpenRouterModel) - enforced both when a teacher saves a model in
- *   Settings and again at call time in aiScore, so this fallback tier can
+ *   Questions are marked one at a time, not concurrently (see the
+ *   /api/submit handler), specifically to avoid bursting simultaneous
+ *   requests at the same provider/key - a common trigger for rate-limiting.
+ *   If a question's entire chain fails on the first pass (transient
+ *   rate-limits being the most likely cause), the whole chain is retried in
+ *   full up to AI_MARKING_MAX_PASSES times, with a pause in between, before
+ *   that question falls back to the offline rule-based scorer - this is the
+ *   main safeguard that keeps AI marking landing successfully rather than
+ *   silently degrading to the weaker offline scorer.
+ * *   Settings and again at call time in aiScore, so this fallback tier can
  *   never end up calling a paid model.
  */
 
@@ -90,14 +90,13 @@ const GROQ_MODEL_OPTIONS = [
   { id: "qwen/qwen3.6-27b", label: "Qwen3.6 27B" },
 ];
 
-// OpenRouter is the final AI fallback tier for every question (see
-// ROUND_FALLBACK_CHAINS / aiScore) - tried only after that question's own
-// dedicated marker and its two AI fallbacks have all failed. Only free
-// models are ever allowed here (see isFreeOpenRouterModel) - this fallback
-// tier exists to keep the app from hard-failing, not to run up a bill, so
-// the app enforces this both when a teacher saves a model in Settings and
-// again at call time in aiScore, in case the config table ever ends up with
-// something else by some other route.
+// OpenRouter is the 3rd AI tier tried for every question (see aiScore) -
+// after both Gemini keys and both Groq keys have failed, and before Workers
+// AI. Only free models are ever allowed here (see isFreeOpenRouterModel) -
+// this fallback tier exists to keep the app from hard-failing, not to run
+// up a bill, so the app enforces this both when a teacher saves a model in
+// Settings and again at call time in aiScore, in case the config table ever
+// ends up with something else by some other route.
 //
 // The default, "openrouter/free", is OpenRouter's own free-model router: it
 // auto-selects a free model for each request (filtering for the features
@@ -1022,18 +1021,23 @@ async function fetchImageAsBase64(url) {
 }
 
 // ---------- Provider: Groq (2nd marker, https://console.groq.com) ----------
-async function callGroq(env, system, user, model) {
+// ---------- Provider: Groq (https://console.groq.com) ----------
+// Two API keys can be configured - env.GROQ_API_KEY and env.GROQ_API_KEY_2 -
+// tried in that order, so a second account's free-tier quota is available
+// if the first is exhausted or rate-limited. See aiScore for where both get
+// queued as separate attempts.
+async function callGroq(env, system, user, model, apiKey) {
   const resp = await fetch("https://api.groq.com/openai/v1/chat/completions", {
     method: "POST",
     headers: {
       "content-type": "application/json",
-      authorization: "Bearer " + env.GROQ_API_KEY,
+      authorization: "Bearer " + apiKey,
     },
     body: JSON.stringify({
       // Model is teacher-configurable from Settings (config:model_groq in
-      // KV), defaulting to DEFAULT_GROQ_MODEL if never set. If Groq
-      // deprecates the default, update DEFAULT_GROQ_MODEL / GROQ_MODEL_OPTIONS
-      // above (see console.groq.com/docs/deprecations).
+      // the D1 config table), defaulting to DEFAULT_GROQ_MODEL if never set.
+      // If Groq deprecates the default, update DEFAULT_GROQ_MODEL /
+      // GROQ_MODEL_OPTIONS above (see console.groq.com/docs/deprecations).
       model: model || DEFAULT_GROQ_MODEL,
       messages: [
         { role: "system", content: system },
@@ -1055,15 +1059,19 @@ async function callGroq(env, system, user, model) {
   return extractJson(text);
 }
 
-// ---------- Provider: Google Gemini (2nd marker, https://aistudio.google.com/apikey) ----------
-async function callGemini(env, system, user, image) {
+// ---------- Provider: Google Gemini (https://aistudio.google.com/apikey) ----------
+// Two API keys can be configured - env.GEMINI_API_KEY and
+// env.GEMINI_API_KEY_2 - tried in that order, same reasoning as Groq/
+// OpenRouter above: a second account's free-tier quota is available if the
+// first is exhausted or rate-limited.
+async function callGemini(env, system, user, image, apiKey) {
   const model = "gemini-2.5-flash"; // fast + cheap, generous free tier, multimodal
   const parts = [{ text: user }];
   if (image && image.base64) {
     parts.push({ inline_data: { mime_type: image.mimeType, data: image.base64 } });
   }
   const resp = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${env.GEMINI_API_KEY}`,
+    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
     {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -1090,7 +1098,7 @@ async function callGemini(env, system, user, image) {
   return extractJson(text);
 }
 
-// ---------- Provider: Cloudflare Workers AI (3rd marker, free, built into this Worker) ----------
+// ---------- Provider: Cloudflare Workers AI (final AI-tier marker, free, built into this Worker) ----------
 async function callWorkersAI(env, system, user) {
   const model = "@cf/meta/llama-3.3-70b-instruct-fp8-fast"; // confirmed active, not on Cloudflare's deprecation list as of Aug 2026
   let result;
@@ -1112,7 +1120,7 @@ async function callWorkersAI(env, system, user) {
   return extractJson(text);
 }
 
-// ---------- Provider: OpenRouter (final fallback tier, https://openrouter.ai) ----------
+// ---------- Provider: OpenRouter (https://openrouter.ai) ----------
 // Two API keys can be configured - env.OPENROUTER_API_KEY and
 // env.OPENROUTER_API_KEY_2 - tried in that order, so a second account's
 // free-tier quota is available if the first is exhausted or rate-limited.
@@ -1152,24 +1160,26 @@ async function callOpenRouter(env, system, user, model, apiKey) {
   return extractJson(text);
 }
 
-// ---------- AI marking: per-question primary marker, each other provider as fallback, OpenRouter as final tier, offline scorer as last resort ----------
-// Each of the 3 questions in a submission has its own dedicated primary AI
-// marker, but if that provider is unavailable or its call fails, the other
-// two AI providers are tried before giving up on "real" AI marking - and
-// OpenRouter (with up to 2 keys) is the shared final AI tier for every
-// question. Only if every attempt in the chain fails does a question fall
-// back to the offline rule-based scorer.
-//   Question 1 (index 0): Gemini -> Groq -> Workers AI -> OpenRouter
-//   Question 2 (index 1): Groq -> Workers AI -> Gemini -> OpenRouter
-//   Question 3 (index 2): Workers AI -> Gemini -> Groq -> OpenRouter
-const ROUND_PROVIDERS = ["gemini", "groq", "workers-ai"];
-const ROUND_FALLBACK_CHAINS = {
-  gemini: ["gemini", "groq", "workers-ai"],
-  groq: ["groq", "workers-ai", "gemini"],
-  "workers-ai": ["workers-ai", "gemini", "groq"],
-};
+// ---------- AI marking: 2x Gemini -> 2x Groq -> 2x OpenRouter -> Workers AI -> offline scorer ----------
+// Every question is marked with the same chain, tried in this fixed order:
+// both Gemini keys, then both Groq keys, then both OpenRouter keys, then
+// Workers AI (single, no key). Any tier with no key/binding configured is
+// skipped. If the whole chain fails once (e.g. transient rate-limiting), it
+// is retried in full up to AI_MARKING_MAX_PASSES times, with a pause between
+// passes, before that question falls back to the offline rule-based scorer
+// - see aiScore. Questions themselves are marked one at a time (not in
+// parallel, see the /api/submit handler) specifically to avoid bursting
+// several simultaneous requests at the same provider/key, which is what
+// tends to trigger rate limits in the first place.
+const AI_MARKING_MAX_PASSES = 2; // how many times to retry the *entire* chain for one question before giving up to the offline scorer
+const AI_ATTEMPT_PAUSE_MS = 350; // brief pause between individual provider attempts within a chain
+const AI_PASS_RETRY_PAUSE_MS = 3000; // longer pause before retrying the whole chain again (gives transient rate-limits time to clear)
 
-async function aiScore(env, topic, question, mode, data, primaryProvider) {
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function aiScore(env, topic, question, mode, data) {
   const storedRubric = await getConfig(env, "rubric");
   const rubricText = (storedRubric && storedRubric.trim()) || DEFAULT_RUBRIC;
   const storedGroqModel = await getConfig(env, "model_groq");
@@ -1188,47 +1198,42 @@ async function aiScore(env, topic, question, mode, data, primaryProvider) {
   const imageDescription = (topic && topic.imageDescription) || "";
 
   // Only Gemini is vision-capable. Fetch the picture once up front whenever
-  // Gemini is configured at all - it may be this question's primary marker,
-  // or just a fallback later in its chain, but either way if a Gemini
-  // attempt happens it should get the real picture, not just the
-  // description. Every other provider (including Gemini's own fallbacks)
-  // uses the text-only prompt with the teacher's imageDescription instead.
+  // either Gemini key is configured - every other provider (Groq, Workers
+  // AI, OpenRouter) uses the text-only prompt with the teacher's
+  // imageDescription instead.
   let image = null;
-  if (env.GEMINI_API_KEY && topic && topic.imageUrl) {
+  if ((env.GEMINI_API_KEY || env.GEMINI_API_KEY_2) && topic && topic.imageUrl) {
     image = await fetchImageAsBase64(topic.imageUrl);
   }
   const visionPrompts = buildPrompts(topic, question, mode, data, rubricText, { imageAttached: !!image, imageDescription, fillerStats });
   const textOnlyPrompts = image ? buildPrompts(topic, question, mode, data, rubricText, { imageAttached: false, imageDescription, fillerStats }) : visionPrompts;
 
-  const chain = ROUND_FALLBACK_CHAINS[primaryProvider] || ROUND_FALLBACK_CHAINS.gemini;
   const attempts = [];
-  for (const p of chain) {
-    if (p === "gemini" && env.GEMINI_API_KEY) {
-      attempts.push({ name: "gemini", run: () => callGemini(env, visionPrompts.system, visionPrompts.user, image) });
-    } else if (p === "groq" && env.GROQ_API_KEY) {
-      attempts.push({ name: "groq", run: () => callGroq(env, textOnlyPrompts.system, textOnlyPrompts.user, groqModel) });
-    } else if (p === "workers-ai" && env.AI) {
-      attempts.push({ name: "workers-ai", run: () => callWorkersAI(env, textOnlyPrompts.system, textOnlyPrompts.user) });
+  if (env.GEMINI_API_KEY) attempts.push({ name: "gemini", run: () => callGemini(env, visionPrompts.system, visionPrompts.user, image, env.GEMINI_API_KEY) });
+  if (env.GEMINI_API_KEY_2) attempts.push({ name: "gemini", run: () => callGemini(env, visionPrompts.system, visionPrompts.user, image, env.GEMINI_API_KEY_2) });
+  if (env.GROQ_API_KEY) attempts.push({ name: "groq", run: () => callGroq(env, textOnlyPrompts.system, textOnlyPrompts.user, groqModel, env.GROQ_API_KEY) });
+  if (env.GROQ_API_KEY_2) attempts.push({ name: "groq", run: () => callGroq(env, textOnlyPrompts.system, textOnlyPrompts.user, groqModel, env.GROQ_API_KEY_2) });
+  if (env.OPENROUTER_API_KEY) attempts.push({ name: "openrouter", run: () => callOpenRouter(env, textOnlyPrompts.system, textOnlyPrompts.user, openRouterModel, env.OPENROUTER_API_KEY) });
+  if (env.OPENROUTER_API_KEY_2) attempts.push({ name: "openrouter", run: () => callOpenRouter(env, textOnlyPrompts.system, textOnlyPrompts.user, openRouterModel, env.OPENROUTER_API_KEY_2) });
+  if (env.AI) attempts.push({ name: "workers-ai", run: () => callWorkersAI(env, textOnlyPrompts.system, textOnlyPrompts.user) });
+
+  for (let pass = 1; pass <= AI_MARKING_MAX_PASSES; pass++) {
+    for (let i = 0; i < attempts.length; i++) {
+      try {
+        const raw = await attempts[i].run();
+        return normalizeAiResult(raw, attempts[i].name);
+      } catch (e) {
+        // this attempt failed or errored - pause briefly (spreads out load
+        // on whichever provider/key is next) then try the next one
+        if (i < attempts.length - 1) await sleep(AI_ATTEMPT_PAUSE_MS);
+      }
     }
-  }
-  // OpenRouter is the shared final AI tier for every question, regardless of
-  // its primary marker - tried with each configured key in turn before
-  // giving up on AI marking entirely.
-  if (env.OPENROUTER_API_KEY) {
-    attempts.push({ name: "openrouter", run: () => callOpenRouter(env, textOnlyPrompts.system, textOnlyPrompts.user, openRouterModel, env.OPENROUTER_API_KEY) });
-  }
-  if (env.OPENROUTER_API_KEY_2) {
-    attempts.push({ name: "openrouter", run: () => callOpenRouter(env, textOnlyPrompts.system, textOnlyPrompts.user, openRouterModel, env.OPENROUTER_API_KEY_2) });
+    // Every attempt in this pass failed. If this wasn't the last allowed
+    // pass, wait longer (transient rate-limits are the most likely cause)
+    // and run through the entire chain again from the top before giving up.
+    if (pass < AI_MARKING_MAX_PASSES) await sleep(AI_PASS_RETRY_PAUSE_MS);
   }
 
-  for (const attempt of attempts) {
-    try {
-      const raw = await attempt.run();
-      return normalizeAiResult(raw, attempt.name);
-    } catch (e) {
-      // this attempt failed or errored - try the next one in the chain
-    }
-  }
   return { ...ruleBasedScore(mode, data, topic, fillerStats), markedBy: "fallback" };
 }
 
@@ -1484,9 +1489,17 @@ export default {
           roundInputs.push({ question, cleanedData, anyFlag, answerForRecord });
         }
 
-        const results = await Promise.all(
-          roundInputs.map((ri, i) => aiScore(env, topic, ri.question, mode, ri.cleanedData, ROUND_PROVIDERS[i] || "gemini"))
-        );
+        // Mark each question one at a time (not Promise.all) - marking all 3
+        // questions concurrently means up to 3x the simultaneous requests
+        // hitting the same provider/key, which is exactly what tends to
+        // trigger rate limits. A short pause between questions spaces the
+        // load out further still. See aiScore for the per-question retry
+        // logic that adds further resilience against transient rate-limits.
+        const results = [];
+        for (let i = 0; i < roundInputs.length; i++) {
+          results.push(await aiScore(env, topic, roundInputs[i].question, mode, roundInputs[i].cleanedData));
+          if (i < roundInputs.length - 1) await sleep(AI_ATTEMPT_PAUSE_MS);
+        }
 
         let scoreSum = 0;
         let anyFallback = false;
