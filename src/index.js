@@ -37,20 +37,37 @@
  * LOWER() comparisons now instead of .toLowerCase() in JS.
  *
  * Secrets / bindings
- *   env.GROQ_API_KEY        2nd AI marker, wrangler secret put GROQ_API_KEY (console.groq.com)
- *   env.GEMINI_API_KEY      1st AI marker (vision-capable), wrangler secret put GEMINI_API_KEY (aistudio.google.com/apikey)
- *   env.AI                  3rd AI marker, Cloudflare Workers AI (free, [ai] binding in wrangler.toml)
- *   Marking chain: Gemini -> Groq -> Workers AI -> offline rule-based scorer.
- *   Gemini is tried first because it's the only vision-capable provider here -
- *   it's sent the actual topic picture (fetched + base64-encoded server-side)
- *   so the Evidence (E1) part can be checked against what's really in the
- *   picture, not just judged on plausibility. Groq and Workers AI are
- *   text-only and instead use the teacher's optional imageDescription field
- *   (or, failing that, are told plainly they can't see the picture and to
- *   mark E1 on plausibility only). Each provider is tried in order and
- *   skipped (not retried) if its key/binding is missing or the call fails,
- *   falling through to the next. If all three AI providers are unavailable,
- *   marking falls back to the offline scorer.
+ *   env.GEMINI_API_KEY       Question 1's primary marker (vision-capable), wrangler secret put GEMINI_API_KEY (aistudio.google.com/apikey)
+ *   env.GROQ_API_KEY         Question 2's primary marker, wrangler secret put GROQ_API_KEY (console.groq.com)
+ *   env.AI                   Question 3's primary marker, Cloudflare Workers AI (free, [ai] binding in wrangler.toml)
+ *   env.OPENROUTER_API_KEY   Final AI fallback tier for every question, wrangler secret put OPENROUTER_API_KEY (openrouter.ai/keys)
+ *   env.OPENROUTER_API_KEY_2 Optional 2nd OpenRouter key, tried after the first if it fails/is rate-limited (same setup, a 2nd account/key)
+ *
+ *   Each of the 3 questions in a submission has its own dedicated primary AI
+ *   marker, but falls through the other two AI providers before giving up,
+ *   with OpenRouter as a shared final AI tier for every question (see
+ *   ROUND_FALLBACK_CHAINS / aiScore):
+ *     Question 1 (index 0): Gemini -> Groq -> Workers AI -> OpenRouter
+ *     Question 2 (index 1): Groq -> Workers AI -> Gemini -> OpenRouter
+ *     Question 3 (index 2): Workers AI -> Gemini -> Groq -> OpenRouter
+ *   Gemini marks question 1 first specifically because it's the only
+ *   vision-capable provider here - whenever a Gemini attempt actually runs
+ *   (as a primary marker or as a fallback), it's sent the actual topic
+ *   picture (fetched + base64-encoded server-side) so the Evidence (E1) part
+ *   can be checked against what's really in the picture, not just judged on
+ *   plausibility. Every other provider (Groq, Workers AI, OpenRouter) is
+ *   text-only and instead uses the teacher's optional imageDescription field
+ *   for the Evidence part (or, failing that, is told plainly it can't see
+ *   the picture and to mark E1 on plausibility only). Each attempt in a
+ *   question's chain is skipped (not retried) if its key/binding is missing
+ *   or the call fails, falling through to the next. Only if every attempt in
+ *   a question's chain fails - all 3 AI providers plus both OpenRouter keys -
+ *   does that one question fall back to the offline rule-based scorer.
+ *
+ *   OpenRouter is only ever allowed to call FREE models (see
+ *   isFreeOpenRouterModel) - enforced both when a teacher saves a model in
+ *   Settings and again at call time in aiScore, so this fallback tier can
+ *   never end up calling a paid model.
  */
 
 import { VULGAR_WORDS } from "./vulgarity-list.js";
@@ -59,9 +76,9 @@ import { SEED_TOPICS } from "./seed-topics.js";
 
 const TEACHER_USERNAME = "palpatine"; // trigger username for hidden teacher tools
 
-// Teacher-configurable via Settings (config:model_groq in KV); this is only
-// the default used until a teacher picks something else. Kept in sync with
-// Groq's currently-active model list - see console.groq.com/docs/models.
+// Teacher-configurable via Settings (config table, key model_groq); this is
+// only the default used until a teacher picks something else. Kept in sync
+// with Groq's currently-active model list - see console.groq.com/docs/models.
 const DEFAULT_GROQ_MODEL = "openai/gpt-oss-120b";
 // Models a teacher can pick from Settings without having to know exact model
 // IDs. If Groq deprecates one of these, update this list and redeploy - a
@@ -72,6 +89,42 @@ const GROQ_MODEL_OPTIONS = [
   { id: "openai/gpt-oss-20b", label: "GPT-OSS 20B (faster, lighter)" },
   { id: "qwen/qwen3.6-27b", label: "Qwen3.6 27B" },
 ];
+
+// OpenRouter is the final AI fallback tier for every question (see
+// ROUND_FALLBACK_CHAINS / aiScore) - tried only after that question's own
+// dedicated marker and its two AI fallbacks have all failed. Only free
+// models are ever allowed here (see isFreeOpenRouterModel) - this fallback
+// tier exists to keep the app from hard-failing, not to run up a bill, so
+// the app enforces this both when a teacher saves a model in Settings and
+// again at call time in aiScore, in case the config table ever ends up with
+// something else by some other route.
+//
+// The default, "openrouter/free", is OpenRouter's own free-model router: it
+// auto-selects a free model for each request (filtering for the features
+// the request needs - see openrouter.ai/openrouter/free) rather than
+// pinning to one model ID, so it keeps working even as OpenRouter's
+// specific free-tier model lineup changes over time. A teacher can still
+// pin a specific model instead via the options below or by typing any other
+// model ID that ends in ":free" (OpenRouter's own naming convention for its
+// free-tier model variants - see openrouter.ai/models?max_price=0).
+const DEFAULT_OPENROUTER_MODEL = "openrouter/free";
+const OPENROUTER_MODEL_OPTIONS = [
+  { id: "openrouter/free", label: "Free Models Router (default - auto-picks a free model)" },
+  { id: "meta-llama/llama-3.3-70b-instruct:free", label: "Llama 3.3 70B (free tier)" },
+  { id: "google/gemini-2.0-flash-exp:free", label: "Gemini 2.0 Flash (free tier, via OpenRouter)" },
+  { id: "qwen/qwen-2.5-72b-instruct:free", label: "Qwen 2.5 72B (free tier)" },
+  { id: "deepseek/deepseek-chat:free", label: "DeepSeek Chat (free tier)" },
+];
+
+// True for OpenRouter's own free-model router, or any model slug ending in
+// OpenRouter's ":free" suffix convention. Anything else - a paid model, or a
+// typo missing the suffix - is rejected wherever this is checked, so
+// OpenRouter can never be configured (accidentally or otherwise) to call a
+// paid model.
+function isFreeOpenRouterModel(modelId) {
+  const id = String(modelId || "").trim();
+  return id === "openrouter/free" || /:free$/i.test(id);
+}
 
 const DEFAULT_RUBRIC = `The total score is 25 marks: 20 marks for TREES and 5 marks for Language Use.
 
@@ -1059,39 +1112,121 @@ async function callWorkersAI(env, system, user) {
   return extractJson(text);
 }
 
-// ---------- AI marking: Groq -> Gemini -> Workers AI -> rule-based (offline) ----------
-async function aiScore(env, topic, question, mode, data) {
+// ---------- Provider: OpenRouter (final fallback tier, https://openrouter.ai) ----------
+// Two API keys can be configured - env.OPENROUTER_API_KEY and
+// env.OPENROUTER_API_KEY_2 - tried in that order, so a second account's
+// free-tier quota is available if the first is exhausted or rate-limited.
+// See aiScore for where both get queued as separate attempts.
+async function callOpenRouter(env, system, user, model, apiKey) {
+  const resp = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: "Bearer " + apiKey,
+      // OpenRouter uses these two headers for attribution/leaderboard
+      // purposes only - harmless if left as-is, but feel free to change
+      // them to match your actual deployment URL / app name.
+      "HTTP-Referer": "https://just-a-chit-chat.pages.dev",
+      "X-Title": "Just a Chit-Chat",
+    },
+    body: JSON.stringify({
+      // Model is teacher-configurable from Settings (config:model_openrouter),
+      // defaulting to DEFAULT_OPENROUTER_MODEL if never set.
+      model: model || DEFAULT_OPENROUTER_MODEL,
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: user },
+      ],
+      response_format: { type: "json_object" },
+      temperature: 0.4,
+    }),
+  });
+  if (!resp.ok) {
+    const bodyText = await resp.text().catch(() => "");
+    console.error("OpenRouter API error", resp.status, bodyText.slice(0, 500));
+    throw new Error("OpenRouter API error " + resp.status);
+  }
+  const data = await resp.json();
+  const text = data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
+  if (!text) throw new Error("OpenRouter: empty response");
+  return extractJson(text);
+}
+
+// ---------- AI marking: per-question primary marker, each other provider as fallback, OpenRouter as final tier, offline scorer as last resort ----------
+// Each of the 3 questions in a submission has its own dedicated primary AI
+// marker, but if that provider is unavailable or its call fails, the other
+// two AI providers are tried before giving up on "real" AI marking - and
+// OpenRouter (with up to 2 keys) is the shared final AI tier for every
+// question. Only if every attempt in the chain fails does a question fall
+// back to the offline rule-based scorer.
+//   Question 1 (index 0): Gemini -> Groq -> Workers AI -> OpenRouter
+//   Question 2 (index 1): Groq -> Workers AI -> Gemini -> OpenRouter
+//   Question 3 (index 2): Workers AI -> Gemini -> Groq -> OpenRouter
+const ROUND_PROVIDERS = ["gemini", "groq", "workers-ai"];
+const ROUND_FALLBACK_CHAINS = {
+  gemini: ["gemini", "groq", "workers-ai"],
+  groq: ["groq", "workers-ai", "gemini"],
+  "workers-ai": ["workers-ai", "gemini", "groq"],
+};
+
+async function aiScore(env, topic, question, mode, data, primaryProvider) {
   const storedRubric = await getConfig(env, "rubric");
   const rubricText = (storedRubric && storedRubric.trim()) || DEFAULT_RUBRIC;
   const storedGroqModel = await getConfig(env, "model_groq");
   const groqModel = (storedGroqModel && storedGroqModel.trim()) || DEFAULT_GROQ_MODEL;
+  const storedOpenRouterModel = await getConfig(env, "model_openrouter");
+  // Defense in depth: even though POST /api/teacher/model-openrouter already
+  // rejects non-free models, re-validate here at call time too - if the
+  // config table ever ends up with a non-free value some other way (e.g.
+  // edited directly in D1), silently fall back to the safe free default
+  // rather than ever actually calling a paid model.
+  const candidateOpenRouterModel = (storedOpenRouterModel && storedOpenRouterModel.trim()) || DEFAULT_OPENROUTER_MODEL;
+  const openRouterModel = isFreeOpenRouterModel(candidateOpenRouterModel) ? candidateOpenRouterModel : DEFAULT_OPENROUTER_MODEL;
 
   const combinedText = mode === "single" ? data.text || "" : TREES_ORDER.map(([key]) => data.parts[key] || "").join(" ");
   const fillerStats = countFillers(combinedText);
   const imageDescription = (topic && topic.imageDescription) || "";
 
-  // Gemini is tried first specifically because it's the only vision-capable
-  // provider here - fetch the picture once, up front, so we know whether a
-  // real image or only the teacher's fallback description is available.
+  // Only Gemini is vision-capable. Fetch the picture once up front whenever
+  // Gemini is configured at all - it may be this question's primary marker,
+  // or just a fallback later in its chain, but either way if a Gemini
+  // attempt happens it should get the real picture, not just the
+  // description. Every other provider (including Gemini's own fallbacks)
+  // uses the text-only prompt with the teacher's imageDescription instead.
   let image = null;
   if (env.GEMINI_API_KEY && topic && topic.imageUrl) {
     image = await fetchImageAsBase64(topic.imageUrl);
   }
-
   const visionPrompts = buildPrompts(topic, question, mode, data, rubricText, { imageAttached: !!image, imageDescription, fillerStats });
   const textOnlyPrompts = image ? buildPrompts(topic, question, mode, data, rubricText, { imageAttached: false, imageDescription, fillerStats }) : visionPrompts;
 
+  const chain = ROUND_FALLBACK_CHAINS[primaryProvider] || ROUND_FALLBACK_CHAINS.gemini;
   const attempts = [];
-  if (env.GEMINI_API_KEY) attempts.push({ name: "gemini", run: () => callGemini(env, visionPrompts.system, visionPrompts.user, image) });
-  if (env.GROQ_API_KEY) attempts.push({ name: "groq", run: () => callGroq(env, textOnlyPrompts.system, textOnlyPrompts.user, groqModel) });
-  if (env.AI) attempts.push({ name: "workers-ai", run: () => callWorkersAI(env, textOnlyPrompts.system, textOnlyPrompts.user) });
+  for (const p of chain) {
+    if (p === "gemini" && env.GEMINI_API_KEY) {
+      attempts.push({ name: "gemini", run: () => callGemini(env, visionPrompts.system, visionPrompts.user, image) });
+    } else if (p === "groq" && env.GROQ_API_KEY) {
+      attempts.push({ name: "groq", run: () => callGroq(env, textOnlyPrompts.system, textOnlyPrompts.user, groqModel) });
+    } else if (p === "workers-ai" && env.AI) {
+      attempts.push({ name: "workers-ai", run: () => callWorkersAI(env, textOnlyPrompts.system, textOnlyPrompts.user) });
+    }
+  }
+  // OpenRouter is the shared final AI tier for every question, regardless of
+  // its primary marker - tried with each configured key in turn before
+  // giving up on AI marking entirely.
+  if (env.OPENROUTER_API_KEY) {
+    attempts.push({ name: "openrouter", run: () => callOpenRouter(env, textOnlyPrompts.system, textOnlyPrompts.user, openRouterModel, env.OPENROUTER_API_KEY) });
+  }
+  if (env.OPENROUTER_API_KEY_2) {
+    attempts.push({ name: "openrouter", run: () => callOpenRouter(env, textOnlyPrompts.system, textOnlyPrompts.user, openRouterModel, env.OPENROUTER_API_KEY_2) });
+  }
 
   for (const attempt of attempts) {
     try {
       const raw = await attempt.run();
       return normalizeAiResult(raw, attempt.name);
     } catch (e) {
-      // this provider failed or errored - try the next one in the chain
+      // this attempt failed or errored - try the next one in the chain
     }
   }
   return { ...ruleBasedScore(mode, data, topic, fillerStats), markedBy: "fallback" };
@@ -1350,7 +1485,7 @@ export default {
         }
 
         const results = await Promise.all(
-          roundInputs.map((ri) => aiScore(env, topic, ri.question, mode, ri.cleanedData))
+          roundInputs.map((ri, i) => aiScore(env, topic, ri.question, mode, ri.cleanedData, ROUND_PROVIDERS[i] || "gemini"))
         );
 
         let scoreSum = 0;
@@ -1658,6 +1793,31 @@ export default {
           return json({ ok: true, model: DEFAULT_GROQ_MODEL, isDefault: true });
         }
         await setConfig(env, "model_groq", model);
+        return json({ ok: true, model, isDefault: false });
+      }
+
+      if (pathname === "/api/teacher/model-openrouter" && request.method === "GET") {
+        if (!requireSuperAdmin(session)) return json({ error: "Not authorised." }, 403);
+        const stored = await getConfig(env, "model_openrouter");
+        return json({ model: stored || DEFAULT_OPENROUTER_MODEL, isDefault: !stored, options: OPENROUTER_MODEL_OPTIONS });
+      }
+
+      if (pathname === "/api/teacher/model-openrouter" && request.method === "POST") {
+        if (!requireSuperAdmin(session)) return json({ error: "Not authorised." }, 403);
+        const body = await request.json();
+        const model = (body.model || "").trim();
+        if (!model) {
+          await deleteConfig(env, "model_openrouter"); // reset to default
+          return json({ ok: true, model: DEFAULT_OPENROUTER_MODEL, isDefault: true });
+        }
+        // OpenRouter is a shared fallback tier for every question - only
+        // free models (":free" suffix, or the "openrouter/free" auto-router)
+        // are ever allowed here, so this can't silently start running up a
+        // bill. See isFreeOpenRouterModel.
+        if (!isFreeOpenRouterModel(model)) {
+          return badRequest('Only free OpenRouter models are allowed here - the model ID must end in ":free" (e.g. meta-llama/llama-3.3-70b-instruct:free), or be "openrouter/free" (OpenRouter\'s free-model auto-router). See openrouter.ai/models?max_price=0 for the current free-tier list.');
+        }
+        await setConfig(env, "model_openrouter", model);
         return json({ ok: true, model, isDefault: false });
       }
 
