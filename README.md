@@ -169,48 +169,67 @@ There are now two kinds of teacher login:
 Nothing else about pupil login changes: pupils still just type
 `Name@Class` (e.g. `Jovan@5IG`) or just `Name` if class isn't needed.
 
-## 4. AI marking: Gemini → Groq → Cloudflare Workers AI → offline scorer
+## 4. AI marking: dedicated marker per question, each other AI as fallback, OpenRouter as shared final tier, offline scorer as last resort
 
-Marking uses three AI providers, tried in order, then an offline scorer as a
-last resort, so pupils are never left without feedback:
+Each submission has 3 questions, and each question now has its own dedicated
+**primary** AI marker, rather than all three sharing one fallback chain:
 
-1. **Google Gemini** (1st) — the only vision-capable provider here. It's
-   sent the actual topic picture (fetched and base64-encoded server-side) so
-   it can verify the Evidence (E1) part against what's really in the
-   picture, not just judge plausibility. Requires one API key.
-2. **Groq** (2nd) — fast, free-tier Llama marking, used if Gemini's key is
-   missing or a Gemini call fails/is rate-limited. Text-only — see "Picture
-   Description" below for how it still marks Evidence sensibly. Requires one
-   API key.
-3. **Cloudflare Workers AI** (3rd) — free, built into this Worker via the
-   `[ai]` binding in `wrangler.toml`, no signup needed. Also text-only. Used
-   automatically if both Gemini and Groq are unavailable.
-4. If all three are unavailable, marking falls back further to a simple
-   offline rule-based keyword/relevance/language score, so the app never
-   hard-fails — pupils just get less nuanced feedback until AI marking is
-   back. This offline scorer is intentionally strict (it checks for on-topic
-   content and specific keyword/grammar patterns, not just answer length),
-   so it under-scores rather than over-scores while it's active — see the
-   in-app AI status badge below.
+- **Question 1 → Google Gemini** (falls back to Groq, then Workers AI, then OpenRouter)
+- **Question 2 → Groq** (falls back to Workers AI, then Gemini, then OpenRouter)
+- **Question 3 → Cloudflare Workers AI** (falls back to Gemini, then Groq, then OpenRouter)
+
+So a question's primary marker is tried first; if it's unavailable (missing
+key/binding) or its call fails, the other two AI providers are tried in
+turn; **OpenRouter is a shared final AI tier for every question**, tried
+last, with up to two keys attempted in order; and only if every attempt in
+that chain fails does the question fall back to an offline rule-based
+scorer, so pupils are never left without feedback:
+
+1. **Google Gemini** — the only vision-capable provider here. When a Gemini
+   attempt actually runs (as question 1's primary marker, or as a fallback
+   for question 2 or 3), it's sent the actual topic picture (fetched and
+   base64-encoded server-side) so it can verify the Evidence (E1) part
+   against what's really in the picture, not just judge plausibility.
+   Requires one API key.
+2. **Groq** — fast, free-tier Llama marking. Text-only — see "Picture
+   Description" below for how it still marks Evidence sensibly. Requires
+   one API key.
+3. **Cloudflare Workers AI** — free, built into this Worker via the `[ai]`
+   binding in `wrangler.toml`, no signup needed. Also text-only.
+4. **OpenRouter** — the shared final AI fallback tier for all 3 questions,
+   tried only after that question's own three AI providers have all failed.
+   Text-only. Up to two API keys can be configured — the second is tried if
+   the first fails or is rate-limited, effectively doubling your free-tier
+   headroom on this fallback tier if you have two OpenRouter accounts/keys.
+   **Only free models are ever allowed here** — see "Free models only" below.
+5. If every attempt in a question's chain fails — all 3 AI providers plus
+   both OpenRouter keys — marking falls back further to a simple offline
+   rule-based keyword/relevance/language score for that one question, so the
+   app never hard-fails — pupils just get less nuanced feedback for that
+   question until AI marking is back. This offline scorer is intentionally
+   strict (it checks for on-topic content and specific keyword/grammar
+   patterns, not just answer length), so it under-scores rather than
+   over-scores while it's active — see the in-app AI status badge below.
 
 Pupils and teachers can always see which mode marked a given question: a
-green **"AI connected"** badge means one of the three AI providers marked it;
+green **"AI connected"** badge means one of the four AI providers marked it;
 a red **"AI unavailable"** badge means it fell all the way through to the
 offline scorer, and the score may be less accurate as a result. Non-practice
 attempts that hit the offline scorer are also kept off the leaderboard.
 
 ### Picture Description (fallback for text-only providers)
 
-Since only Gemini can actually see the picture, Groq and Workers AI need
-another way to judge whether an Evidence (E1) claim is accurate. Teacher
-Tools → Topics → each topic has an optional **"Picture Description"** field
-— describe what's actually in the picture (not the topic in general), and
-Groq/Workers AI will use that text instead of guessing. If it's left blank,
-those two providers are told plainly that they can't see the picture and to
-mark Evidence on plausibility/specificity only, without penalising for
-accuracy they can't verify. This also matters if Gemini's own image fetch
-fails (broken link, non-image response, image blocked by the host) — Gemini
-falls back to the same description-based marking for that attempt.
+Since only Gemini can actually see the picture, whichever provider ends up
+marking a question when it isn't Gemini needs another way to judge whether
+an Evidence (E1) claim is accurate. Teacher Tools → Topics → each topic has
+an optional **"Picture Description"** field — describe what's actually in
+the picture (not the topic in general), and Groq/Workers AI/OpenRouter will
+use that text instead of guessing. If it's left blank, those providers are
+told plainly that they can't see the picture and to mark Evidence on
+plausibility/specificity only, without penalising for accuracy they can't
+verify. This also matters if Gemini's own image fetch fails (broken link,
+non-image response, image blocked by the host) — Gemini falls back to the
+same description-based marking for that attempt.
 
 ### Set your Gemini key
 
@@ -220,7 +239,7 @@ wrangler secret put GEMINI_API_KEY
 
 Paste your key from [Google AI Studio](https://aistudio.google.com/apikey)
 when prompted. This is a real credential, so — unlike the teacher password —
-it's stored as an encrypted Worker **secret**, never in KV, `wrangler.toml`,
+it's stored as an encrypted Worker **secret**, never in D1, `wrangler.toml`,
 or any source file.
 
 ### Set your Groq key (optional but recommended)
@@ -232,10 +251,51 @@ wrangler secret put GROQ_API_KEY
 Paste your key from [console.groq.com](https://console.groq.com) when
 prompted. Same rules as the Gemini key — stored as an encrypted secret,
 never in source or `wrangler.toml`. This step is optional; without it,
-marking just skips straight from Gemini to Workers AI. If a key was ever
-pasted somewhere insecure (a chat, a doc, a screenshot), regenerate it in
-the relevant console — old keys can just be revoked with no other cleanup
-needed.
+question 2 marks with Workers AI instead (its next fallback), and Groq is
+simply skipped as a fallback for questions 1 and 3 too.
+
+### Set your OpenRouter key(s) (optional but recommended)
+
+```bash
+wrangler secret put OPENROUTER_API_KEY
+wrangler secret put OPENROUTER_API_KEY_2
+```
+
+Paste keys from [openrouter.ai/keys](https://openrouter.ai/keys) when
+prompted. `OPENROUTER_API_KEY_2` is optional — set it only if you have a
+second OpenRouter account/key you want tried as a backup when the first is
+exhausted or rate-limited. Without either key, OpenRouter is simply skipped
+and a question falls straight to the offline scorer if its 3 AI providers
+have all failed.
+
+If a key was ever pasted somewhere insecure (a chat, a doc, a screenshot),
+regenerate it in the relevant console — old keys can just be revoked with no
+other cleanup needed.
+
+### Free models only (OpenRouter)
+
+OpenRouter is a paid platform in general, but it also hosts a number of
+`:free`-tagged model variants, and provides
+[`openrouter/free`](https://openrouter.ai/openrouter/free) — a special
+router model that auto-picks a free model for you on every request
+(filtering for whatever features that request needs). Since OpenRouter is a
+shared fallback for every question, the app is built to only ever call free
+models on it, enforced twice:
+
+1. **At save time** — Teacher Tools → Settings rejects any OpenRouter model
+   ID that isn't `openrouter/free` or doesn't end in `:free`.
+2. **At call time** — even if the `config` table's `model_openrouter` value
+   were ever changed some other way (e.g. edited directly via D1's console),
+   `aiScore()` re-validates it before every call and silently substitutes
+   the safe default (`openrouter/free`) if it isn't a free model.
+
+The default, `openrouter/free`, needs no maintenance as OpenRouter's
+specific free-model lineup changes over time — it just keeps routing to
+whatever's currently free. If you'd rather pin a specific model instead
+(for more consistent behaviour, say), pick one from
+[openrouter.ai/models?max_price=0](https://openrouter.ai/models?max_price=0)
+— anything on that list will already have the `:free` suffix and pass
+validation.
 
 ### Free tier notes
 
@@ -247,15 +307,21 @@ needed.
   [Groq's docs](https://console.groq.com/docs/rate-limits) for current
   numbers.
 - **Workers AI**: the Workers Free plan includes 10,000 "Neurons" of use per
-  day, which comfortably covers normal classroom use as a fallback. See
+  day, which comfortably covers normal classroom use. See
   [Cloudflare's Workers AI pricing](https://developers.cloudflare.com/workers-ai/platform/pricing/)
   for current numbers.
+- **OpenRouter**: rate limits vary by model, but only free models can be
+  configured here at all (see "Free models only" above), so this tier stays
+  free by construction. See [OpenRouter's docs](https://openrouter.ai/docs)
+  for current free-tier rate limits.
 
 ### Changing models later
 
-Edit the `model` string in `callGroq()`, `callGemini()`, or `callWorkersAI()`
-in `src/index.js` (e.g. to a newer release) and redeploy. The Groq model can
-also be changed without redeploying — see Teacher Tools → Settings.
+Edit the `model` string in `callGemini()` or `callWorkersAI()` in
+`src/index.js` (e.g. to a newer release) and redeploy — these two aren't
+teacher-configurable from Settings. The Groq and OpenRouter models **can**
+be changed without redeploying — see Teacher Tools → Settings → "Groq
+Marking Model" / "OpenRouter Marking Model".
 
 ## 4b. Language Use, filler words, and the model answer (v6)
 
@@ -401,7 +467,8 @@ assigned classes:
   URL, **3** examiner questions, tags) or edit/delete existing ones. All 3
   question fields are used as the 3 graded rounds, so fill in all of them.
 - **Settings** *(palpatine only)* — change palpatine's password, edit the
-  **AI marking rubric**, and choose the **Groq marking model** (both below)
+  **AI marking rubric**, and choose the **Groq** and **OpenRouter marking
+  models** (all below)
 - **Admins** *(palpatine only)* — create, edit, or remove teacher-admin
   accounts and their assigned classes (see "Roles" above).
 
@@ -413,20 +480,28 @@ that point on — it's the actual scoring guidance the model follows. It's
 stored in D1 (`config` table, key `rubric`), so no redeploy needed, and it applies
 immediately to the next submission. Leave it blank and hit Save to fall back
 to the built-in default rubric (also visible in `src/index.js` as
-`DEFAULT_RUBRIC`). This only affects **AI marking** — if none of Groq,
-Gemini, or Workers AI is reachable, scoring uses the offline keyword-based
-fallback instead, which doesn't read the rubric.
+`DEFAULT_RUBRIC`). This only affects **AI marking** — if a question's entire
+chain (its 3 AI providers plus both OpenRouter keys) is unreachable, that
+question's scoring uses the offline keyword-based fallback instead, which
+doesn't read the rubric.
 
-### Where to change the Groq model
+### Where to change the Groq / OpenRouter models
 
-Teacher Tools → **Settings** → "Groq Marking Model" dropdown. Pick one of the
-known models, or choose "Other" to type any valid Groq model ID directly (see
+Teacher Tools → **Settings** → "Groq Marking Model" / "OpenRouter Marking
+Model" dropdowns. Pick one of the known models, or choose "Other" to type
+any valid model ID directly — for Groq, see
 [console.groq.com/docs/models](https://console.groq.com/docs/models) for the
-current list). This only changes which model **Groq** uses — Gemini and
-Workers AI keep their own fixed models, changeable only by editing
-`src/index.js`. Stored in D1 (`config` table, key `model_groq`), applies immediately, no
-redeploy needed. Leave it on the default and hit Save (or hit Reset to
-Default) to go back to the built-in default (`openai/gpt-oss-120b`).
+current list; for OpenRouter, any model ID must end in `:free` (or be
+`openrouter/free`) — see
+[openrouter.ai/models?max_price=0](https://openrouter.ai/models?max_price=0)
+for the current free-tier list, and "Free models only" above for why this is
+enforced. These only change which model **Groq**/**OpenRouter** use — Gemini
+and Workers AI keep their own fixed models, changeable only by editing
+`src/index.js`. Stored in D1 (`config` table, keys `model_groq` /
+`model_openrouter`), applies immediately, no redeploy needed. Leave it on
+the default and hit Save (or hit Reset to Default) to go back to the
+built-in defaults (`openai/gpt-oss-120b` for Groq, `openrouter/free` for
+OpenRouter).
 
 ### Marking scheme (TREES + Language Use — PEEL has been removed)
 
@@ -467,11 +542,12 @@ A pupil's **final score** for the practice session is the average of their
 3 question scores (each out of 25), rounded to 1 decimal place, minus the
 repeated-ideas penalty (if it applied) once per attempt.
 
-If none of Gemini, Groq, or Workers AI is reachable, the built-in offline fallback
-approximates this with simple keyword checks (pronouns, time/place words,
-"because", sequence words like "then"/"in the end", reflection words like
-"felt"/"learnt") — it's a rough stand-in, not real understanding, and the
-app tells pupils that in the feedback text.
+If a question's entire marking chain is unreachable (its 3 AI providers plus
+both OpenRouter keys), the built-in offline fallback approximates this with
+simple keyword checks (pronouns, time/place words, "because", sequence words
+like "then"/"in the end", reflection words like "felt"/"learnt") — it's a
+rough stand-in, not real understanding, and the app tells pupils that in the
+feedback text.
 
 ### Response modes: separated TREES vs single response box
 
@@ -511,9 +587,10 @@ warm-ups or re-tries before a graded attempt.
 - **Latency**: each submission now makes 3 sequential AI marking calls (one
   per question) before returning the final score, so expect a few seconds
   of "Marking all 3 answers..." — this is normal.
-- **Cost**: with Groq's free tier and Workers AI as fallback, this whole app
-  runs on free tiers for a single class — Workers, D1, KV, Groq, and Workers
-  AI all have free daily allowances. The only way you'd pay anything is if you
-  exceed Groq's free-tier rate limits on a very large or very active class,
-  in which case Workers AI (also free, just a lower-throughput fallback)
-  picks up the slack automatically.
+- **Cost**: with Groq and OpenRouter's free tiers plus Workers AI as further
+  fallback, this whole app runs on free tiers for a single class — Workers,
+  D1, KV, Groq, Workers AI, and OpenRouter (on a `:free`-tagged model) all
+  have free daily allowances. The only way you'd pay anything is if a
+  question's primary marker AND its first two fallbacks all hit their
+  free-tier limits at once, in which case OpenRouter (also free, just a
+  lower-throughput fallback) picks up the slack automatically.

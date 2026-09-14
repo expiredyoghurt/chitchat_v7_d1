@@ -1,0 +1,35 @@
+// Basic English + common Singlish profanity list used to mask pupil input
+// before it is stored, scored, or shown on the leaderboard.
+// This is intentionally a starter list of common mild-to-strong swear words
+// (no slurs). Teachers can extend it by editing this file and redeploying.
+export const VULGAR_WORDS = [
+  "damn",
+  "hell",
+  "crap",
+  "shit",
+  "shitty",
+  "fuck",
+  "fucking",
+  "fucker",
+  "bitch",
+  "bastard",
+  "asshole",
+  "ass",
+  "dick",
+  "piss",
+  "bloody",
+  "kanina",
+  "cb",
+  "cheebye",
+  "chee bye",
+  "sial",
+  "lanjiao",
+  "puki",
+  "pukimak",
+  "bodoh",
+  "idiot",
+  "stupid",
+  "dumb",
+  "retard",
+  "retarded",
+];

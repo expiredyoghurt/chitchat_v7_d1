@@ -109,7 +109,7 @@ own servers doing it, not your computer.
 6. Confirm/start the deployment. Cloudflare will build and deploy the
    Worker; this typically takes under a minute.
 
-### A6. Add your Gemini (and optionally Groq) API key as secrets
+### A6. Add your Gemini (and optionally Groq / OpenRouter) API keys as secrets
 
 1. Once the Worker exists, open it in the Cloudflare dashboard and go to
    **Settings → Variables and Bindings** (wording may vary — look for
@@ -119,16 +119,22 @@ own servers doing it, not your computer.
    - Value: your key from [Google AI Studio](https://aistudio.google.com/apikey)
    - Type: **Secret / Encrypted** (not plain text) — this matches what
      `wrangler secret put GEMINI_API_KEY` would have done locally. Gemini is
-     the primary marker since it's the only one that can see the topic
-     picture.
+     question 1's primary marker since it's the only one that can see the
+     topic picture (and a fallback for questions 2 and 3).
 3. Optional, but recommended for a stronger fallback chain: add a second
    variable the same way:
    - Name: `GROQ_API_KEY`
    - Value: your key from [console.groq.com](https://console.groq.com)
    - Type: **Secret / Encrypted**
-4. Save. The values won't be visible again after saving — that's expected
+4. Also optional, but recommended as the shared final AI fallback tier for
+   all 3 questions: add one or two more variables the same way:
+   - Name: `OPENROUTER_API_KEY` (and optionally a second, `OPENROUTER_API_KEY_2`,
+     if you have a backup OpenRouter account/key)
+   - Value: your key(s) from [openrouter.ai/keys](https://openrouter.ai/keys)
+   - Type: **Secret / Encrypted**
+5. Save. The values won't be visible again after saving — that's expected
    and is the whole point of a secret.
-5. While you're in this panel, confirm there's a binding for **Workers AI**
+6. While you're in this panel, confirm there's a binding for **Workers AI**
    named `AI`, a **D1 database** binding named `CCv6_DB` pointing at
    `chitchat-v7`, and a **KV Namespace** binding named `CCv6_DATA` pointing
    at the namespace you created — add them here manually if `wrangler.toml`
@@ -187,6 +193,8 @@ this project needs.
    - A **Workers AI** binding named `AI`
    - A **Secret** named `GEMINI_API_KEY` with your Gemini key
    - Optionally, a **Secret** named `GROQ_API_KEY` with your Groq key
+   - Optionally, **Secret(s)** named `OPENROUTER_API_KEY` (and
+     `OPENROUTER_API_KEY_2`) with your OpenRouter key(s)
 6. Set the teacher password the same way as Path A step A7 (Storage &
    Databases → D1 SQL Database → `chitchat-v7` → Console → run the
    `INSERT INTO config ...` statement from step A7 with your password).
@@ -234,8 +242,9 @@ Whichever path you used, from here the app behaves exactly as described in
   against the D1 database (step A3) — a missing table shows up as a
   "Server error" mentioning the table name.
 - **Marking always uses the fallback / feedback looks generic** — check
-  that `GEMINI_API_KEY` (or `GROQ_API_KEY`) was saved as a **Secret**, not a
-  plain text variable, and that there's no typo in the name.
+  that `GEMINI_API_KEY` (or `GROQ_API_KEY`/`OPENROUTER_API_KEY`) was saved
+  as a **Secret**, not a plain text variable, and that there's no typo in
+  the name.
 - **UI labels don't match this guide** — Cloudflare and GitHub occasionally
   redesign their dashboards. Tell me what you're actually seeing (a
   screenshot description, menu names visible to you) and I'll help you find
