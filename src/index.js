@@ -1384,7 +1384,7 @@ export default {
 
         const pupilClassKey = pupilClass || "unassigned";
         const token = uid();
-        await env.CCv6_DATA.put(
+        await env.CCv6_DATA(
           `session:${token}`,
           JSON.stringify({ name, pupilClass: pupilClassKey, role: "pupil", createdAt: Date.now() }),
           { expirationTtl: 60 * 60 * 6 }
@@ -1421,7 +1421,7 @@ export default {
         }
 
         const token = uid();
-        await env.CCv6_DATA.put(
+        await env.CCv6_DATA(
           `session:${token}`,
           JSON.stringify({ name, role: "teacher", isSuperAdmin, assignedClasses, createdAt: Date.now() }),
           { expirationTtl: 60 * 60 * 6 }
