@@ -20,9 +20,11 @@ database_id = "e59f0f2b-fde6-4e57-b998-7074aa7da318"
 # expirationTtl gives free automatic session expiry that D1 doesn't have
 # built in). Create with:  wrangler kv:namespace create CCv6_DATA
 # Then paste the returned id below.
-kv_namespaces = [
-  { binding = "CCv6_DATA", id = "e1815085e13c4be092a5162986f77e16" }
-]
+
+[[kv_namespaces]]
+binding = "CCv6_DATA"
+id = "e1815085e13c4be092a5162986f77e16"
+
 
 # --- Teacher password ---
 # Lives in D1 (config table, key "teacher_password"), not hardcoded in this
