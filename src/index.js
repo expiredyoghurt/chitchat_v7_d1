@@ -125,6 +125,15 @@ function isFreeOpenRouterModel(modelId) {
   return id === "openrouter/free" || /:free$/i.test(id);
 }
 
+// Cap on an uploaded topic picture's data: URL length (Teacher Tools ->
+// Topics -> "Upload a picture"). D1 caps a single row at 2,000,000 bytes
+// total (see developers.cloudflare.com/d1/platform/limits) - this leaves
+// headroom in that row for the topic's title/questions/tags/coach JSON
+// alongside the image itself. The frontend already compresses uploads to
+// fit well under this before they're ever sent here; this is a server-side
+// backstop, not the primary size control.
+const MAX_TOPIC_IMAGE_DATA_URL_LENGTH = 1900000;
+
 const DEFAULT_RUBRIC = `The total score is 25 marks: 20 marks for TREES and 5 marks for Language Use.
 
 TREES is marked out of 20 marks total, distributed as follows:
@@ -384,6 +393,54 @@ async function setConfig(env, key, value) {
 }
 async function deleteConfig(env, key) {
   await env.CCv6_DB.prepare("DELETE FROM config WHERE key = ?").bind(key).run();
+}
+
+// Thrown from inside a handler when the right response is a plain,
+// pupil-readable 400 rather than a 500 "Server error: ..." - see the outer
+// catch in fetch().
+class HandledSubmitError extends Error {}
+
+// ---------- "Try Again" (retry) policy ----------
+// Whether a pupil is offered a "Try Again" button on their results screen is
+// teacher-controlled: one global default, plus optional per-class overrides.
+// Stored as a single config row so it's one read per submission rather than a
+// row per class. Shape: { global: true, classes: { "5ig": false } } - class
+// keys are lowercased, and a class with no entry simply follows `global`.
+//
+// Default is ON: a retry is marked, stored and leaderboarded exactly like a
+// fresh attempt (it's a genuinely new submission, just traceably linked to
+// the one it revises), so it's additive rather than something that changes
+// how existing attempts are scored. Turn it off globally, or per class, from
+// Teacher Tools -> Try Again when a class is doing a real assessment.
+const RETRY_POLICY_KEY = "retry_policy";
+
+function normalizeClassKey(pupilClass) {
+  return String(pupilClass || "unassigned").trim().toLowerCase();
+}
+
+async function getRetryPolicy(env) {
+  const stored = await getConfig(env, RETRY_POLICY_KEY);
+  let parsed = null;
+  if (stored) {
+    try {
+      parsed = JSON.parse(stored);
+    } catch (e) {
+      parsed = null; // corrupt value - fall back to the default rather than 500
+    }
+  }
+  const classes = {};
+  if (parsed && parsed.classes && typeof parsed.classes === "object") {
+    for (const [k, v] of Object.entries(parsed.classes)) classes[normalizeClassKey(k)] = !!v;
+  }
+  return { global: parsed && typeof parsed.global === "boolean" ? parsed.global : true, classes };
+}
+
+// A per-class override always wins over the global default, including when it
+// switches retries ON for one class while they're off everywhere else.
+function isRetryEnabledForClass(policy, pupilClass) {
+  const key = normalizeClassKey(pupilClass);
+  if (Object.prototype.hasOwnProperty.call(policy.classes, key)) return !!policy.classes[key];
+  return !!policy.global;
 }
 
 // The teacher password is stored as { salt, hash } (SHA-256), never in
@@ -847,6 +904,55 @@ function clampNumber(n, min, max) {
   return Math.min(max, Math.max(min, Math.round(num)));
 }
 
+// ---------- "Stronger version" (modelAnswer) length policy ----------
+// The model answer exists to show a pupil what THEIR OWN answer could sound
+// like if it were better - so a rewrite that is shorter and thinner than what
+// the pupil actually wrote is worse than showing nothing at all. A fixed
+// absolute target ("60-120 words") predictably undershoots for any pupil who
+// wrote more than that, and the 7-attempt marking chain makes this worse:
+// weaker fallback models (Workers AI, free OpenRouter models) under-elaborate
+// compared to Gemini, so length used to vary by whichever provider happened
+// to answer. Instead the target is now derived from the pupil's own word
+// count, restated in the prompt, and checked server-side afterwards.
+const MODEL_ANSWER_MAX_CHARS = 1500; // hard ceiling stored/returned (was 900 - too tight for a legitimately longer rewrite of a wordy pupil)
+const MODEL_ANSWER_MIN_RATIO = 1.1; // rewrite must be at least this many times the pupil's word count
+const MODEL_ANSWER_FLOOR_WORDS = 60; // ...but never ask for less than this, or a 10-word pupil answer gets an 11-word "model answer"
+const MODEL_ANSWER_CEILING_WORDS = 220; // ...and never ask for more than roughly fits in MODEL_ANSWER_MAX_CHARS
+
+function countWords(text) {
+  return (text || "").trim().split(/\s+/).filter(Boolean).length;
+}
+
+// How many words the rewrite must reach to count as "stronger" for a pupil
+// answer of pupilWords words. Returns 0 when there is nothing to improve on
+// (blank answer) - in that case no length rule is applied at all.
+function modelAnswerTargetWords(pupilWords) {
+  if (!pupilWords) return 0;
+  const scaled = Math.ceil(pupilWords * MODEL_ANSWER_MIN_RATIO);
+  return Math.min(MODEL_ANSWER_CEILING_WORDS, Math.max(MODEL_ANSWER_FLOOR_WORDS, scaled));
+}
+
+// Which part of the pupil's response the rewrite is actually based on: the
+// Experience part in split mode, the whole thing in single mode. Comparing
+// against the wrong one would demand a rewrite ~4x too long in split mode.
+function pupilAnswerForModelAnswer(mode, data) {
+  return mode === "single" ? (data.text || "") : (data.parts && data.parts.E2) || "";
+}
+
+// Truncation that doesn't guillotine a sentence in half. Prefers to end on
+// the last full sentence inside the cap; only if that would throw away most
+// of the text does it fall back to a word-boundary cut with an ellipsis.
+function trimModelAnswer(text) {
+  const clean = (text || "").trim();
+  if (clean.length <= MODEL_ANSWER_MAX_CHARS) return clean;
+  const slice = clean.slice(0, MODEL_ANSWER_MAX_CHARS);
+  const lastStop = Math.max(slice.lastIndexOf("."), slice.lastIndexOf("!"), slice.lastIndexOf("?"));
+  if (lastStop > MODEL_ANSWER_MAX_CHARS * 0.6) return slice.slice(0, lastStop + 1).trim();
+  const room = clean.slice(0, MODEL_ANSWER_MAX_CHARS - 3); // leave space for the ellipsis so the cap still holds
+  const lastSpace = room.lastIndexOf(" ");
+  return (lastSpace > 0 ? room.slice(0, lastSpace) : room).trim() + "...";
+}
+
 // The AI is asked to self-report a "total", but models occasionally return a
 // total that doesn't match the sum of their own breakdown, or sub-scores that
 // exceed their stated max. Rather than trust the model's arithmetic, we
@@ -903,7 +1009,7 @@ function normalizeAiResult(raw, markedBy) {
     breakdown: normalized,
     feedback: typeof raw.feedback === "string" && raw.feedback.trim() ? raw.feedback.slice(0, 600) : "Marked - see the breakdown below for details.",
     suggestion: typeof raw.suggestion === "string" ? raw.suggestion.slice(0, 300) : "",
-    modelAnswer: typeof raw.modelAnswer === "string" && raw.modelAnswer.trim() ? raw.modelAnswer.trim().slice(0, 900) : "",
+    modelAnswer: typeof raw.modelAnswer === "string" && raw.modelAnswer.trim() ? trimModelAnswer(raw.modelAnswer) : "",
     markedBy,
   };
 }
@@ -931,6 +1037,26 @@ function buildPrompts(topic, question, mode, data, rubricText, opts) {
     visionInstruction = `You cannot see the actual picture and no teacher description was provided for it. For the Evidence (E1) part, judge only on plausibility and specificity of the claim - award partial credit for a specific, plausible-sounding reference to the picture, but do not penalise for visual accuracy you have no way to verify.`;
   }
 
+  // Relative, not absolute, length target for the "stronger version" the
+  // pupil is shown - see MODEL_ANSWER_* above. A rewrite that is shorter than
+  // what the pupil already wrote isn't a model answer, it's a downgrade.
+  const pupilWords = opts.pupilWords || 0;
+  const targetWords = opts.targetWords || 0;
+  const modelAnswerInstruction = targetWords
+    ? `Also write "modelAnswer": a rewritten, STRONGER version of the pupil's OWN Experience answer (or their combined answer if in single mode) that keeps their real content and experience but fixes grammar, adds the specific 5W1H detail their version was missing, and reads more fluently - this shows the pupil what a stronger version of THEIR OWN answer could sound like, not a generic unrelated example.
+LENGTH RULE for "modelAnswer" (important): the pupil's own answer is ${pupilWords} words long, so your rewrite MUST be at least ${targetWords} words - at least as many words as the original, ideally more. NEVER write a shorter or less detailed answer than the pupil's own. Every extra word must add real, specific detail the original lacked (exactly who was there, what happened, when, where, why, how it ended, and how they felt) - do not pad with repetition, waffle, or praise. Stay under about ${MODEL_ANSWER_CEILING_WORDS} words.`
+    : `Also write "modelAnswer": since the pupil left their answer blank or nearly blank, write a short example answer (roughly 60-120 words) for this topic and question showing the kind of specific 5W1H personal experience that would score well.`;
+
+  // Only set on a bounded one-time regenerate: the first response came back
+  // shorter than the pupil's own answer, so the model is told exactly how it
+  // fell short rather than just being asked again.
+  const lengthRetry = opts.lengthRetry;
+  const retryInstruction = lengthRetry
+    ? `
+
+SECOND ATTEMPT - YOUR PREVIOUS "modelAnswer" WAS TOO SHORT: you returned a rewrite of only ${lengthRetry.modelWords} words for a pupil answer of ${lengthRetry.pupilWords} words. That is a weaker answer than the pupil's own, which is unacceptable. Produce the full JSON again, and this time make "modelAnswer" at least ${lengthRetry.targetWords} words, longer and more specific than the pupil's original, expanding the 5W1H detail rather than repeating yourself.`
+    : "";
+
   const fillerInstruction =
     fillerStats.totalWords > 0
       ? `Filler-word check (already counted by the app, not your job to recount): the pupil's full answer contains ${fillerStats.count} filler word(s) (um/uh/erm/like/you know, etc.) out of ${fillerStats.totalWords} total words (${Math.round(fillerStats.density * 100)}% filler density). Note this is only as reliable as the speech-to-text transcript, which sometimes smooths over disfluencies - use it as one signal, not the only one, when scoring Fluency & Delivery.`
@@ -951,7 +1077,7 @@ Be encouraging in tone, age-appropriate for a 9-12 year old. For the Experience 
 If the Experience answer lacks depth (vague on who/what/when/where, or reads as generic/memorised), say so plainly in the Experience part's "note" - name what was actually missing (e.g. "unclear where and when this happened, and who else was there") - and give 1-2 concrete example experiences the pupil could have shared instead, related to the topic, in the "suggestion" field.
 Language Use is separate from content - judge Grammar Accuracy (0-2) and Vocabulary Range & Appropriateness (0-2) from the pupil's actual sentences (not from how interesting their ideas are), and Fluency & Delivery (0-1) mainly from the filler-word signal above and general smoothness of the transcript.
 Give ONE concrete, actionable suggestion for improvement per weak part in that part's "note".
-Also write "modelAnswer": a short rewritten version (roughly 60-120 words) of the pupil's OWN Experience answer (or their combined answer if in single mode) that keeps their real content/experience but fixes grammar, adds specific missing 5W1H detail, and reads more fluently - this shows the pupil what a stronger version of THEIR OWN answer could sound like, not a generic unrelated example.
+${modelAnswerInstruction}
 Respond with ONLY valid JSON, no markdown fences, no preamble, no explanation before or after, matching exactly this shape:
 {
   "breakdown": [
@@ -976,8 +1102,8 @@ Respond with ONLY valid JSON, no markdown fences, no preamble, no explanation be
   "max": ${FULL_MAX_TOTAL},
   "feedback": "2-3 encouraging sentences summarising strengths and one thing to work on, max 60 words",
   "suggestion": "one concrete practical tip to improve their next experience answer - if depth was lacking, include 1-2 example experiences they could share instead, max 40 words",
-  "modelAnswer": "a rewritten, stronger version of the pupil's own answer, roughly 60-120 words"
-}`;
+  "modelAnswer": ${targetWords ? `"a rewritten, stronger version of the pupil's own answer - at least ${targetWords} words, never shorter than their original"` : `"a short example answer, roughly 60-120 words"`}
+}${retryInstruction}`;
 
   const content =
     mode === "single"
@@ -999,8 +1125,18 @@ ${content}`;
 // (bad URL, non-image response, too large, network error) - callers must
 // treat that as "no image available" and fall back to the teacher's text
 // description (topic.imageDescription) if one was set.
+//
+// Topics uploaded via Teacher Tools -> Topics -> "Upload a picture" store
+// the picture as a data: URL (already base64, compressed client-side) in
+// this same imageUrl field rather than an http(s) link - handled here by
+// parsing it directly instead of trying to fetch it back over the network.
 async function fetchImageAsBase64(url) {
   if (!url) return null;
+  if (url.startsWith("data:")) {
+    const match = /^data:([^;,]+)(?:;charset=[^;,]+)?;base64,([\s\S]*)$/.exec(url);
+    if (!match) return null; // not a base64 data URL (e.g. an unsupported data: encoding) - treat as unavailable
+    return { mimeType: match[1], base64: match[2] };
+  }
   try {
     const resp = await fetch(url, { headers: { accept: "image/*" } });
     if (!resp.ok) return null;
@@ -1179,6 +1315,48 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// Server-side guarantee that the "stronger version" panel is never strictly
+// worse than what the pupil wrote. LLMs - especially the weaker fallback
+// models in the chain - don't reliably obey length instructions, so the
+// prompt's length rule is enforced here rather than trusted:
+//
+//   1. If the rewrite already meets the target, use it (the common case,
+//      no extra API call at all).
+//   2. If not, fire ONE extra call back to the SAME provider/key that just
+//      answered, telling it exactly how short it came up. Only the
+//      modelAnswer from that call is adopted - the scores from the first,
+//      already-normalized response are kept, so a retry can't shuffle a
+//      pupil's marks around.
+//   3. If the retry is still short (or fails), suppress the panel entirely
+//      by returning an empty modelAnswer. The frontend already renders
+//      nothing for an empty string, so this needs no UI change.
+//
+// Because step 2 only fires in the minority of cases where the prompt alone
+// wasn't enough, this adds very little extra load on the rate-limited free
+// tiers.
+async function ensureStrongerModelAnswer(result, attempt, makePrompts, pupilWords, targetWords) {
+  if (!targetWords) return result; // pupil wrote (near) nothing - no comparison to make
+  if (!result.modelAnswer) return result; // nothing returned; panel is already hidden
+  if (countWords(result.modelAnswer) >= targetWords) return result;
+
+  const firstWords = countWords(result.modelAnswer);
+  try {
+    await sleep(AI_ATTEMPT_PAUSE_MS);
+    const retryPrompts = makePrompts(attempt.vision, { modelWords: firstWords, pupilWords, targetWords });
+    const raw = await attempt.run(retryPrompts);
+    const retried = normalizeAiResult(raw, attempt.markedBy || attempt.name);
+    if (retried.modelAnswer && countWords(retried.modelAnswer) >= targetWords) {
+      return { ...result, modelAnswer: retried.modelAnswer };
+    }
+    // Retry produced something, but still not longer/more detailed than the
+    // pupil's own answer - fall through to suppression rather than show it.
+  } catch (e) {
+    // Retry call failed outright (rate limit, bad JSON, network) - the
+    // pupil's marks and feedback from the first response are unaffected.
+  }
+  return { ...result, modelAnswer: "" };
+}
+
 async function aiScore(env, topic, question, mode, data) {
   const storedRubric = await getConfig(env, "rubric");
   const rubricText = (storedRubric && storedRubric.trim()) || DEFAULT_RUBRIC;
@@ -1205,23 +1383,46 @@ async function aiScore(env, topic, question, mode, data) {
   if ((env.GEMINI_API_KEY || env.GEMINI_API_KEY_2) && topic && topic.imageUrl) {
     image = await fetchImageAsBase64(topic.imageUrl);
   }
-  const visionPrompts = buildPrompts(topic, question, mode, data, rubricText, { imageAttached: !!image, imageDescription, fillerStats });
-  const textOnlyPrompts = image ? buildPrompts(topic, question, mode, data, rubricText, { imageAttached: false, imageDescription, fillerStats }) : visionPrompts;
+  // Length target for the "stronger version" shown to the pupil, derived
+  // from what the pupil actually wrote (the Experience part in split mode,
+  // the whole response in single mode) rather than a fixed word count.
+  const pupilWords = countWords(pupilAnswerForModelAnswer(mode, data));
+  const targetWords = modelAnswerTargetWords(pupilWords);
 
+  // Prompts are rebuilt on demand rather than computed once, because the
+  // one-time "your rewrite was too short" regenerate needs the same prompt
+  // plus a retry instruction - see ensureStrongerModelAnswer below.
+  const makePrompts = (useVision, lengthRetry) =>
+    buildPrompts(topic, question, mode, data, rubricText, {
+      imageAttached: useVision && !!image,
+      imageDescription,
+      fillerStats,
+      pupilWords,
+      targetWords,
+      lengthRetry,
+    });
+  const visionPrompts = makePrompts(true, null);
+  const textOnlyPrompts = image ? makePrompts(false, null) : visionPrompts;
+
+  // Each attempt carries `vision` (which prompt variant it gets) and a `run`
+  // that takes prompts, so the very same provider/key can be called again
+  // with the retry prompt without duplicating the wiring.
   const attempts = [];
-  if (env.GEMINI_API_KEY) attempts.push({ name: "gemini", run: () => callGemini(env, visionPrompts.system, visionPrompts.user, image, env.GEMINI_API_KEY) });
-  if (env.GEMINI_API_KEY_2) attempts.push({ name: "gemini", run: () => callGemini(env, visionPrompts.system, visionPrompts.user, image, env.GEMINI_API_KEY_2) });
-  if (env.GROQ_API_KEY) attempts.push({ name: "groq", run: () => callGroq(env, textOnlyPrompts.system, textOnlyPrompts.user, groqModel, env.GROQ_API_KEY) });
-  if (env.GROQ_API_KEY_2) attempts.push({ name: "groq", run: () => callGroq(env, textOnlyPrompts.system, textOnlyPrompts.user, groqModel, env.GROQ_API_KEY_2) });
-  if (env.OPENROUTER_API_KEY) attempts.push({ name: "openrouter", run: () => callOpenRouter(env, textOnlyPrompts.system, textOnlyPrompts.user, openRouterModel, env.OPENROUTER_API_KEY) });
-  if (env.OPENROUTER_API_KEY_2) attempts.push({ name: "openrouter", run: () => callOpenRouter(env, textOnlyPrompts.system, textOnlyPrompts.user, openRouterModel, env.OPENROUTER_API_KEY_2) });
-  if (env.AI) attempts.push({ name: "workers-ai", run: () => callWorkersAI(env, textOnlyPrompts.system, textOnlyPrompts.user) });
+  if (env.GEMINI_API_KEY) attempts.push({ name: "gemini", vision: true, run: (p) => callGemini(env, p.system, p.user, image, env.GEMINI_API_KEY) });
+  if (env.GEMINI_API_KEY_2) attempts.push({ name: "gemini", vision: true, run: (p) => callGemini(env, p.system, p.user, image, env.GEMINI_API_KEY_2) });
+  if (env.GROQ_API_KEY) attempts.push({ name: "groq", vision: false, run: (p) => callGroq(env, p.system, p.user, groqModel, env.GROQ_API_KEY) });
+  if (env.GROQ_API_KEY_2) attempts.push({ name: "groq", vision: false, run: (p) => callGroq(env, p.system, p.user, groqModel, env.GROQ_API_KEY_2) });
+  if (env.OPENROUTER_API_KEY) attempts.push({ name: "openrouter", vision: false, run: (p) => callOpenRouter(env, p.system, p.user, openRouterModel, env.OPENROUTER_API_KEY) });
+  if (env.OPENROUTER_API_KEY_2) attempts.push({ name: "openrouter", vision: false, run: (p) => callOpenRouter(env, p.system, p.user, openRouterModel, env.OPENROUTER_API_KEY_2) });
+  if (env.AI) attempts.push({ name: "workers-ai", vision: false, run: (p) => callWorkersAI(env, p.system, p.user) });
 
   for (let pass = 1; pass <= AI_MARKING_MAX_PASSES; pass++) {
     for (let i = 0; i < attempts.length; i++) {
+      const attempt = attempts[i];
       try {
-        const raw = await attempts[i].run();
-        return normalizeAiResult(raw, attempts[i].name);
+        const raw = await attempt.run(attempt.vision ? visionPrompts : textOnlyPrompts);
+        const result = normalizeAiResult(raw, attempt.name);
+        return await ensureStrongerModelAnswer(result, attempt, makePrompts, pupilWords, targetWords);
       } catch (e) {
         // this attempt failed or errored - pause briefly (spreads out load
         // on whichever provider/key is next) then try the next one
@@ -1259,6 +1460,7 @@ function rowToSubmission(row) {
     gradingDegraded: !!row.grading_degraded,
     repeatedIdeasPenalty: !!row.repeated_ideas_penalty,
     archived: !!row.archived,
+    retryOf: row.retry_of || null,
     createdAt: row.created_at,
   };
 }
@@ -1458,6 +1660,44 @@ export default {
           return badRequest("Expected a topic and exactly 3 answers.");
         }
 
+        // ---- "Try Again" resubmission ----
+        // Validated BEFORE any AI marking runs, so a rejected retry never
+        // burns provider calls. A retry is stored as its own submission row
+        // (marked, scored and leaderboarded exactly like a fresh attempt) and
+        // only linked back to the original through retry_of.
+        const pupilClassForRetry = session.pupilClass || "unassigned";
+        const retryPolicy = await getRetryPolicy(env);
+        const retryEnabled = isRetryEnabledForClass(retryPolicy, pupilClassForRetry);
+        const retryOfRaw = typeof body.retryOf === "string" ? body.retryOf.trim() : "";
+        let retryOf = null;
+        if (retryOfRaw) {
+          if (!retryEnabled) return badRequest("Try Again isn't switched on for your class right now.");
+          const orig = await env.CCv6_DB
+            .prepare("SELECT id, pupil_name, pupil_class, topic_id, retry_of, created_at FROM submissions WHERE id = ?")
+            .bind(retryOfRaw)
+            .first();
+          if (!orig) return badRequest("That first attempt could not be found.");
+          // A pupil may only retry their OWN attempt - never someone else's,
+          // even if they somehow learn its id.
+          if (orig.pupil_name !== session.name || normalizeClassKey(orig.pupil_class) !== normalizeClassKey(pupilClassForRetry)) {
+            return json({ error: "That attempt doesn't belong to you." }, 403);
+          }
+          // One retry per attempt: neither a retry of a retry...
+          if (orig.retry_of) return badRequest("You've already had your second try at this one.");
+          if (orig.topic_id !== topicId) return badRequest("A second try has to be on the same topic as the first.");
+          // Same session only - nothing to re-fetch, and it keeps "Try Again"
+          // an in-the-moment revision rather than a way to farm old attempts.
+          // session.createdAt is set when the pupil logs in (see /api/login).
+          if (session.createdAt && orig.created_at < session.createdAt) {
+            return badRequest("You can only try again during the same session as your first attempt.");
+          }
+          // ...nor a second retry of the same original. (Also enforced by the
+          // UNIQUE index on retry_of, which catches simultaneous resubmits.)
+          const existingRetry = await env.CCv6_DB.prepare("SELECT id FROM submissions WHERE retry_of = ?").bind(orig.id).first();
+          if (existingRetry) return badRequest("You've already had your second try at this one.");
+          retryOf = orig.id;
+        }
+
         const topicRow = await env.CCv6_DB.prepare("SELECT * FROM topics WHERE id = ?").bind(topicId).first();
         const topic = topicRow ? rowToTopic(topicRow) : null;
         const questions = (topic && topic.questions) || [];
@@ -1551,12 +1791,13 @@ export default {
           gradingDegraded: anyFallback,
           repeatedIdeasPenalty: repeatedIdeas,
           archived: false, // v7 bulk archive - Teacher Tools > Submissions
+          retryOf, // null unless this is a "Try Again" second attempt
           createdAt: Date.now(),
         };
         await env.CCv6_DB
           .prepare(
-            `INSERT INTO submissions (id, pupil_name, pupil_class, topic_id, topic_title, mode, rounds, final_score, max_score, practice, grading_degraded, repeated_ideas_penalty, archived, flagged, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`
+            `INSERT INTO submissions (id, pupil_name, pupil_class, topic_id, topic_title, mode, rounds, final_score, max_score, practice, grading_degraded, repeated_ideas_penalty, archived, flagged, created_at, retry_of)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`
           )
           .bind(
             id,
@@ -1572,9 +1813,20 @@ export default {
             record.gradingDegraded ? 1 : 0,
             record.repeatedIdeasPenalty ? 1 : 0,
             record.flagged ? 1 : 0,
-            record.createdAt
+            record.createdAt,
+            record.retryOf
           )
-          .run();
+          .run()
+          .catch((e) => {
+            // The UNIQUE index on retry_of is the last line of defence
+            // against two resubmits racing each other (double-tap, two tabs).
+            // Report it as the same friendly message as the pre-check rather
+            // than a 500.
+            if (retryOf && /unique/i.test(String((e && e.message) || ""))) {
+              throw new HandledSubmitError("You've already had your second try at this one.");
+            }
+            throw e;
+          });
 
         const countsForLeaderboard = !practice && !anyFallback;
         if (countsForLeaderboard) {
@@ -1633,7 +1885,10 @@ export default {
             return rest;
           }),
         };
-        return json({ record: pupilRecord, warning });
+        // retryEnabled tells the pupil's result screen whether to offer a
+        // "Try Again" button. canRetry is false on a retry's own result
+        // screen - one retry per attempt, so there's no third try.
+        return json({ record: pupilRecord, warning, retryEnabled, canRetry: retryEnabled && !retryOf });
       }
 
       // ---------- LEADERBOARD ----------
@@ -1707,6 +1962,7 @@ export default {
             "gradingDegraded",
             "repeatedIdeasPenalty",
             "archived",
+            "retryOf",
             "createdAt",
             "Q1_question",
             "Q1_answer",
@@ -1755,6 +2011,7 @@ export default {
               s.gradingDegraded ? "yes" : "no",
               s.repeatedIdeasPenalty ? "yes" : "no",
               s.archived ? "yes" : "no",
+              s.retryOf || "",
               new Date(s.createdAt).toISOString(),
               ...roundCols,
             ]
@@ -1771,6 +2028,60 @@ export default {
             "access-control-allow-origin": "*",
           },
         });
+      }
+
+      // ---------- "Try Again" policy (all teacher roles) ----------
+      // A super admin sets the global default and may override any class; a
+      // class-scoped teacher-admin sees the global default read-only and may
+      // only override their own assigned classes.
+      if (pathname === "/api/teacher/retry-policy" && request.method === "GET") {
+        if (!requireTeacher(session)) return json({ error: "Not authorised." }, 403);
+        const policy = await getRetryPolicy(env);
+        const { results } = await env.CCv6_DB.prepare("SELECT DISTINCT pupil_class FROM pupils").all();
+        let classes = results.map((r) => r.pupil_class).filter(Boolean);
+        if (!session.isSuperAdmin) {
+          const scoped = (session.assignedClasses || []).map(normalizeClassKey);
+          classes = classes.filter((c) => scoped.includes(normalizeClassKey(c)));
+          // Show an assigned class even if no pupil has logged in from it yet.
+          for (const c of session.assignedClasses || []) {
+            if (!classes.some((x) => normalizeClassKey(x) === normalizeClassKey(c))) classes.push(c);
+          }
+        }
+        classes.sort((a, b) => a.localeCompare(b));
+        return json({
+          global: policy.global,
+          canEditGlobal: !!session.isSuperAdmin,
+          classes: classes.map((c) => ({
+            pupilClass: c,
+            override: Object.prototype.hasOwnProperty.call(policy.classes, normalizeClassKey(c)) ? !!policy.classes[normalizeClassKey(c)] : null,
+            effective: isRetryEnabledForClass(policy, c),
+          })),
+        });
+      }
+
+      if (pathname === "/api/teacher/retry-policy" && request.method === "POST") {
+        if (!requireTeacher(session)) return json({ error: "Not authorised." }, 403);
+        const body = await request.json();
+        const policy = await getRetryPolicy(env);
+
+        if (typeof body.global === "boolean") {
+          if (!requireSuperAdmin(session)) return json({ error: "Only the main teacher account can change the global setting." }, 403);
+          policy.global = body.global;
+        }
+        if (typeof body.pupilClass === "string" && body.pupilClass.trim()) {
+          const key = normalizeClassKey(body.pupilClass);
+          if (!session.isSuperAdmin) {
+            const scoped = (session.assignedClasses || []).map(normalizeClassKey);
+            if (!scoped.includes(key)) return json({ error: "That class isn't one of yours." }, 403);
+          }
+          // null/"inherit" clears the override so the class follows the global
+          // default again, rather than being pinned to whatever it is today.
+          if (body.override === null || body.override === "inherit") delete policy.classes[key];
+          else policy.classes[key] = !!body.override;
+        }
+
+        await setConfig(env, RETRY_POLICY_KEY, JSON.stringify({ global: policy.global, classes: policy.classes }));
+        return json({ ok: true, global: policy.global });
       }
 
       if (pathname === "/api/teacher/rubric" && request.method === "GET") {
@@ -1971,10 +2282,23 @@ export default {
         if (!requireSuperAdmin(session)) return json({ error: "Not authorised." }, 403);
         const body = await request.json();
         const id = body.id || uid();
+        const imageUrl = (body.imageUrl || "").trim();
+        // Uploaded pictures (Teacher Tools -> Topics -> "Upload a picture")
+        // arrive here as a data: URL - the browser already compresses/
+        // resizes them client-side, but re-validate the size server-side
+        // too: D1 caps a single row at 2 MB total (see
+        // developers.cloudflare.com/d1/platform/limits), and this row also
+        // has to fit the title/questions/tags/coach JSON alongside the
+        // image, so this leaves comfortable headroom under that cap.
+        if (imageUrl.startsWith("data:") && imageUrl.length > MAX_TOPIC_IMAGE_DATA_URL_LENGTH) {
+          return badRequest(
+            `That picture is too large to store (~${Math.round(imageUrl.length / 1024)} KB) - Cloudflare D1 limits a topic's total stored size to 2 MB. Please try uploading again (the app compresses automatically at a few quality levels), or choose a smaller/lower-resolution picture.`
+          );
+        }
         const topic = {
           id,
           title: (body.title || "Untitled topic").trim(),
-          imageUrl: (body.imageUrl || "").trim(),
+          imageUrl,
           imageDescription: (body.imageDescription || "").trim().slice(0, 600),
           questions: Array.isArray(body.questions) ? body.questions.filter(Boolean) : [],
           tags: Array.isArray(body.tags) ? body.tags : [],
@@ -2068,6 +2392,9 @@ export default {
 
       return json({ error: "Not found." }, 404);
     } catch (err) {
+      // A pupil-facing message thrown from deeper inside a handler (e.g. the
+      // retry_of UNIQUE race) - report it as a normal 400, not a server error.
+      if (err instanceof HandledSubmitError) return badRequest(err.message);
       return json({ error: "Server error: " + (err && err.message ? err.message : String(err)) }, 500);
     }
   },
