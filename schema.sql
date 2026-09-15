@@ -58,13 +58,22 @@ CREATE TABLE IF NOT EXISTS submissions (
   repeated_ideas_penalty     INTEGER NOT NULL DEFAULT 0,
   archived                   INTEGER NOT NULL DEFAULT 0,
   flagged                    INTEGER NOT NULL DEFAULT 0,
-  created_at                 INTEGER NOT NULL
+  created_at                 INTEGER NOT NULL,
+  -- v7 "Try Again": id of the submission this one is a second attempt at.
+  -- NULL for a normal first attempt. A retry is a genuinely new row and is
+  -- marked/leaderboarded exactly like any other submission - this column
+  -- only links it back to the attempt it revises.
+  retry_of                   TEXT REFERENCES submissions(id)
 );
 CREATE INDEX IF NOT EXISTS idx_subs_class ON submissions(pupil_class);
 CREATE INDEX IF NOT EXISTS idx_subs_topic ON submissions(topic_title);
 CREATE INDEX IF NOT EXISTS idx_subs_archived ON submissions(archived);
 CREATE INDEX IF NOT EXISTS idx_subs_created ON submissions(created_at);
 CREATE INDEX IF NOT EXISTS idx_subs_class_archived ON submissions(pupil_class, archived);
+-- Enforces "only one retry per attempt" in the database itself, so two
+-- simultaneous resubmits can't both slip past the application-level check.
+-- SQLite treats NULLs as distinct, so any number of non-retry rows is fine.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_subs_retry_of ON submissions(retry_of);
 
 CREATE TABLE IF NOT EXISTS teacher_admins (
   username        TEXT PRIMARY KEY,
@@ -82,3 +91,17 @@ CREATE TABLE IF NOT EXISTS config (
   key    TEXT PRIMARY KEY,
   value  TEXT
 );
+
+-- ---------------------------------------------------------------------
+-- Upgrading an EXISTING v7 database (created before "Try Again" existed)?
+-- The CREATE TABLE above won't re-run, so add the column separately:
+--
+--   wrangler d1 execute chitchat-v7 --remote --command \
+--     "ALTER TABLE submissions ADD COLUMN retry_of TEXT REFERENCES submissions(id);"
+--   wrangler d1 execute chitchat-v7 --remote --command \
+--     "CREATE UNIQUE INDEX IF NOT EXISTS idx_subs_retry_of ON submissions(retry_of);"
+--
+-- Existing rows get retry_of = NULL, i.e. "not a retry", which is correct.
+-- Run this BEFORE deploying the new Worker: the submit handler writes to
+-- retry_of on every insert.
+-- ---------------------------------------------------------------------
